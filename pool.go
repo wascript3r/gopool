@@ -35,7 +35,7 @@ func New(size, queue, spawn int) *Pool {
 		panic("size must be greater than zero")
 	}
 	if queue < 0 {
-		panic("queue must be greater then or equal to zero")
+		panic("queue must be greater than or equal to zero")
 	}
 	if spawn < 0 {
 		panic("spawn must be greater than or equal to zero")
