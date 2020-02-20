@@ -16,7 +16,8 @@ var ErrPoolTerminated = errors.New("schedule error: pool is terminated")
 
 // Pool contains logic of goroutine reuse.
 type Pool struct {
-	end chan struct{}
+	size int
+	end  chan struct{}
 
 	mx  *sync.Mutex
 	do  chan func()
@@ -48,7 +49,8 @@ func New(size, queue, spawn int) *Pool {
 	}
 
 	p := &Pool{
-		end: make(chan struct{}),
+		size: size,
+		end:  make(chan struct{}),
 
 		mx:  &sync.Mutex{},
 		do:  make(chan func(), queue),
@@ -64,6 +66,11 @@ func New(size, queue, spawn int) *Pool {
 	}
 
 	return p
+}
+
+// GetSize returns the pool size
+func (p *Pool) GetSize() int {
+	return p.size
 }
 
 // Schedule schedules task to be executed over pool's workers with no provided timeout.
