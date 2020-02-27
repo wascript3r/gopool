@@ -107,14 +107,12 @@ func (p *Pool) schedule(timeout <-chan time.Time, task func()) error {
 }
 
 func (p *Pool) spawn(task func()) error {
-	p.mx.Lock()
-
 	select {
 	case <-p.end:
-		p.mx.Unlock()
 		return ErrPoolTerminated
 
 	default:
+		p.mx.Lock()
 		p.wg.Add(1)
 		p.mx.Unlock()
 
