@@ -17,14 +17,15 @@ var ErrPoolTerminated = errors.New("schedule error: pool is terminated")
 // Pool contains logic of goroutine reuse.
 type Pool struct {
 	size int
-	end  chan struct{}
 
-	mx  *sync.Mutex
-	do  chan func()
-	sem chan struct{}
-	wg  *sync.WaitGroup
+	endC   chan struct{}
+	workC  chan func()
+	spawnC chan struct{}
 
-	once *sync.Once
+	workersWg sync.WaitGroup
+	tasksWg   sync.WaitGroup
+
+	once sync.Once
 }
 
 // New creates new goroutine pool with given size. It also creates a work
@@ -50,18 +51,19 @@ func New(size, queue, spawn int) *Pool {
 
 	p := &Pool{
 		size: size,
-		end:  make(chan struct{}),
 
-		mx:  &sync.Mutex{},
-		do:  make(chan func(), queue),
-		sem: make(chan struct{}, size),
-		wg:  &sync.WaitGroup{},
+		endC:   make(chan struct{}),
+		workC:  make(chan func(), queue),
+		spawnC: make(chan struct{}, size),
 
-		once: &sync.Once{},
+		workersWg: sync.WaitGroup{},
+		tasksWg:   sync.WaitGroup{},
+
+		once: sync.Once{},
 	}
 
 	for i := 0; i < spawn; i++ {
-		p.sem <- struct{}{}
+		p.spawnC <- struct{}{}
 		p.spawn(nil)
 	}
 
@@ -84,47 +86,41 @@ func (p *Pool) ScheduleTimeout(timeout time.Duration, task func()) error {
 }
 
 func (p *Pool) schedule(timeout <-chan time.Time, task func()) error {
+	p.tasksWg.Add(1)
+	defer p.tasksWg.Done()
+
 	select {
-	case <-p.end:
+	case <-p.endC:
 		return ErrPoolTerminated
 
 	default:
 	}
 
 	select {
-	case <-p.end:
+	case <-p.endC:
 		return ErrPoolTerminated
 
-	case p.do <- task:
+	case p.workC <- task:
 		return nil
 
-	case p.sem <- struct{}{}:
-		return p.spawn(task)
+	case p.spawnC <- struct{}{}:
+		p.spawn(task)
+		return nil
 
 	case <-timeout:
 		return ErrScheduleTimeout
 	}
 }
 
-func (p *Pool) spawn(task func()) error {
-	select {
-	case <-p.end:
-		return ErrPoolTerminated
-
-	default:
-		p.mx.Lock()
-		p.wg.Add(1)
-		p.mx.Unlock()
-
-		go p.worker(task)
-		return nil
-	}
+func (p *Pool) spawn(task func()) {
+	p.workersWg.Add(1)
+	go p.worker(task)
 }
 
 func (p *Pool) worker(task func()) {
 	defer func() {
-		<-p.sem
-		p.wg.Done()
+		<-p.spawnC
+		p.workersWg.Done()
 	}()
 
 	for {
@@ -133,10 +129,10 @@ func (p *Pool) worker(task func()) {
 		}
 
 		select {
-		case task = <-p.do:
+		case task = <-p.workC:
 			continue
 
-		case <-p.end:
+		case <-p.endC:
 			return
 		}
 	}
@@ -144,18 +140,17 @@ func (p *Pool) worker(task func()) {
 
 // End returns the read-only channel which indicates when the Pool is terminated.
 func (p *Pool) End() <-chan struct{} {
-	return p.end
+	return p.endC
 }
 
-// Terminate blocks until all workers are terminated and closes all channels.
-func (p *Pool) Terminate() {
+// StopAndWait blocks until all workers are terminated and closes all channels.
+func (p *Pool) StopAndWait() {
 	p.once.Do(func() {
-		close(p.end)
+		close(p.endC)
 
-		p.mx.Lock()
-		p.wg.Wait()
-		close(p.do)
-		close(p.sem)
-		p.mx.Unlock()
+		p.tasksWg.Wait()
+		p.workersWg.Wait()
+		close(p.workC)
+		close(p.spawnC)
 	})
 }
