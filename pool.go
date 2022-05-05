@@ -128,8 +128,8 @@ func (p *Pool) TaskGroup() *TaskGroup {
 	}
 }
 
-// GetSize returns the pool size
-func (p *Pool) GetSize() int {
+// MaxWorkers returns the pool size
+func (p *Pool) MaxWorkers() int {
 	return p.maxWorkers
 }
 
@@ -176,6 +176,7 @@ func (p *Pool) schedule(task func(), timeout <-chan time.Time) (err error) {
 	if task == nil {
 		panic(ErrTaskIsNil)
 	}
+
 	p.tasksWg.Add(1)
 	defer func() {
 		if err != nil {
