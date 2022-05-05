@@ -4,107 +4,130 @@ package gopool
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// ErrScheduleTimeout is returned when there are no free
-// goroutines during some period of time.
-var ErrScheduleTimeout = errors.New("schedule error: timed out")
+var (
+	// ErrScheduleTimeout is returned when there are no free goroutines during some period of time.
+	ErrScheduleTimeout = errors.New("schedule error: timed out")
 
-// ErrPoolTerminated is returned when the schedule method is called, but the Pool is already terminated.
-var ErrPoolTerminated = errors.New("schedule error: pool is terminated")
+	// ErrPoolTerminated is returned when the schedule method is called, but the Pool is already terminated.
+	ErrPoolTerminated = errors.New("schedule error: pool is terminated")
+
+	// ErrTaskIsNil is returned when the schedule method is called with nil task.
+	ErrTaskIsNil = errors.New("schedule error: task is nil")
+)
 
 // Pool contains logic of goroutine reuse.
 type Pool struct {
-	size int
+	maxWorkers     int
+	runningWorkers int32
+	idleWorkers    int32
 
-	endC   chan struct{}
-	workC  chan func()
-	spawnC chan struct{}
+	stopWorkersC chan struct{}
+	stopTasksC   chan struct{}
+	workC        chan func()
 
 	workersWg sync.WaitGroup
 	tasksWg   sync.WaitGroup
 
-	once sync.Once
+	resizer *ratedResizer
+	once    sync.Once
 }
 
 // New creates new goroutine pool with given size. It also creates a work
 // queue of given size. Finally, it spawns given amount of goroutines
 // immediately.
-func New(size, queue, spawn int) *Pool {
-	if size <= 0 {
-		panic("size must be greater than zero")
+func New(maxWorkers, queueSize int) *Pool {
+	if maxWorkers <= 0 {
+		panic("maxWorkers must be greater than zero")
 	}
-	if queue < 0 {
-		panic("queue must be greater than or equal to zero")
-	}
-	if spawn < 0 {
-		panic("spawn must be greater than or equal to zero")
-	}
-
-	if spawn == 0 && queue > 0 {
-		panic("dead queue configuration")
-	}
-	if spawn > size {
-		panic("spawn must be less than or equal to size")
+	if queueSize < 0 {
+		panic("queueSize must be greater than or equal to zero")
 	}
 
 	p := &Pool{
-		size: size,
+		maxWorkers:     maxWorkers,
+		runningWorkers: 0,
+		idleWorkers:    0,
 
-		endC:   make(chan struct{}),
-		workC:  make(chan func(), queue),
-		spawnC: make(chan struct{}, size),
+		stopWorkersC: make(chan struct{}),
+		stopTasksC:   make(chan struct{}),
+		workC:        make(chan func(), queueSize),
 
 		workersWg: sync.WaitGroup{},
 		tasksWg:   sync.WaitGroup{},
 
-		once: sync.Once{},
-	}
-
-	for i := 0; i < spawn; i++ {
-		p.spawnC <- struct{}{}
-		p.spawn(nil)
+		resizer: NewRatedResizer(4),
+		once:    sync.Once{},
 	}
 
 	return p
 }
 
+// TaskGroup creates a new task group
+func (p *Pool) TaskGroup() *TaskGroup {
+	return &TaskGroup{
+		pool: p,
+		wg:   sync.WaitGroup{},
+	}
+}
+
 // GetSize returns the pool size
 func (p *Pool) GetSize() int {
-	return p.size
+	return p.maxWorkers
+}
+
+// RunningWorkers returns the number of running workers
+func (p *Pool) RunningWorkers() int {
+	return int(atomic.LoadInt32(&p.runningWorkers))
+}
+
+// IdleWorkers returns the number of idle workers who are waiting for tasks
+func (p *Pool) IdleWorkers() int {
+	return int(atomic.LoadInt32(&p.idleWorkers))
 }
 
 // Schedule schedules task to be executed over pool's workers with no provided timeout.
 func (p *Pool) Schedule(task func()) error {
-	return p.schedule(nil, task)
+	return p.schedule(task, nil)
 }
 
 // ScheduleTimeout schedules task to be executed over pool's workers with provided timeout.
-func (p *Pool) ScheduleTimeout(timeout time.Duration, task func()) error {
-	return p.schedule(time.After(timeout), task)
+func (p *Pool) ScheduleTimeout(task func(), timeout time.Duration) error {
+	return p.schedule(task, time.After(timeout))
 }
 
-func (p *Pool) schedule(timeout <-chan time.Time, task func()) error {
+func (p *Pool) schedule(task func(), timeout <-chan time.Time) (err error) {
+	if task == nil {
+		panic(ErrTaskIsNil)
+	}
 	p.tasksWg.Add(1)
-	defer p.tasksWg.Done()
+	defer func() {
+		if err != nil {
+			p.tasksWg.Done()
+		}
+	}()
 
 	select {
-	case <-p.endC:
+	case <-p.stopTasksC:
 		return ErrPoolTerminated
 
 	default:
 	}
 
+	runningWorkers := p.RunningWorkers()
+	if p.IdleWorkers() == 0 && runningWorkers < p.maxWorkers && p.resizer.Resize(runningWorkers) {
+		p.spawn(task)
+		return nil
+	}
+
 	select {
-	case <-p.endC:
+	case <-p.stopTasksC:
 		return ErrPoolTerminated
 
 	case p.workC <- task:
-		return nil
-
-	case p.spawnC <- struct{}{}:
-		p.spawn(task)
 		return nil
 
 	case <-timeout:
@@ -114,43 +137,56 @@ func (p *Pool) schedule(timeout <-chan time.Time, task func()) error {
 
 func (p *Pool) spawn(task func()) {
 	p.workersWg.Add(1)
+	atomic.AddInt32(&p.runningWorkers, 1)
 	go p.worker(task)
 }
 
+func (p *Pool) executeTask(task func(), firstTask bool) {
+	defer p.tasksWg.Done()
+
+	if !firstTask {
+		atomic.AddInt32(&p.idleWorkers, -1)
+	}
+	task()
+	atomic.AddInt32(&p.idleWorkers, 1)
+}
+
 func (p *Pool) worker(task func()) {
+	p.executeTask(task, true)
+
 	defer func() {
-		<-p.spawnC
+		atomic.AddInt32(&p.idleWorkers, -1)
+		atomic.AddInt32(&p.runningWorkers, -1)
 		p.workersWg.Done()
 	}()
 
 	for {
-		if task != nil {
-			task()
-		}
-
 		select {
 		case task = <-p.workC:
-			continue
+			if task == nil {
+				return
+			}
+			p.executeTask(task, false)
 
-		case <-p.endC:
+		case <-p.stopWorkersC:
 			return
 		}
 	}
 }
 
-// End returns the read-only channel which indicates when the Pool is terminated.
-func (p *Pool) End() <-chan struct{} {
-	return p.endC
+// Stopped returns the read-only channel which indicates when the Pool is stopped.
+func (p *Pool) Stopped() <-chan struct{} {
+	return p.stopTasksC
 }
 
 // StopAndWait blocks until all workers are terminated and closes all channels.
 func (p *Pool) StopAndWait() {
 	p.once.Do(func() {
-		close(p.endC)
-
+		close(p.stopTasksC)
 		p.tasksWg.Wait()
+
+		close(p.stopWorkersC)
 		p.workersWg.Wait()
 		close(p.workC)
-		close(p.spawnC)
 	})
 }
