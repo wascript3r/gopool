@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-var maxProcs = runtime.GOMAXPROCS(0)
+var maxProcs = runtime.NumCPU()
 
 // Preset pool resizing strategies
 var (
@@ -14,10 +14,12 @@ var (
 	// This strategy is meant for worker pools that will operate at a small percentage of their capacity
 	// most of the time and may occasionally receive bursts of tasks. It's the default strategy.
 	Eager = func() ResizingStrategy { return NewRatedResizer(1) }
+
 	// Balanced tries to find a balance between responsiveness and throughput.
 	// It's suitable for general purpose worker pools or those
 	// that will operate close to 50% of their capacity most of the time.
 	Balanced = func() ResizingStrategy { return NewRatedResizer(maxProcs / 2) }
+
 	// Lazy maximizes throughput at the expense of responsiveness.
 	// This strategy is meant for worker pools that will operate close to their max. capacity most of the time.
 	Lazy = func() ResizingStrategy { return NewRatedResizer(maxProcs) }
