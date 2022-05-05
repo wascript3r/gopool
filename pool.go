@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+const (
+	defaultIdleTimeout = 10 * time.Second
+)
+
 var (
 	// ErrScheduleTimeout is returned when there are no free goroutines during some period of time.
 	ErrScheduleTimeout = errors.New("schedule error: timed out")
@@ -19,9 +23,41 @@ var (
 	ErrTaskIsNil = errors.New("schedule error: task is nil")
 )
 
+// ResizingStrategy represents a pool resizing strategy
+type ResizingStrategy interface {
+	Resize(runningWorkers int) bool
+}
+
+// Option represents an option that can be passed when instantiating a worker pool to customize it
+type Option func(*Pool)
+
+// IdleTimeout allows to change the idle timeout for a worker pool
+func IdleTimeout(idleTimeout time.Duration) Option {
+	return func(pool *Pool) {
+		pool.idleTimeout = idleTimeout
+	}
+}
+
+// MinWorkers allows to change the minimum number of workers of a worker pool
+func MinWorkers(minWorkers int) Option {
+	return func(pool *Pool) {
+		pool.minWorkers = minWorkers
+	}
+}
+
+// Strategy allows to change the strategy used to resize the pool
+func Strategy(strategy ResizingStrategy) Option {
+	return func(pool *Pool) {
+		pool.strategy = strategy
+	}
+}
+
 // Pool contains logic of goroutine reuse.
 type Pool struct {
-	maxWorkers     int
+	maxWorkers  int
+	minWorkers  int
+	idleTimeout time.Duration
+
 	runningWorkers int32
 	idleWorkers    int32
 
@@ -32,23 +68,17 @@ type Pool struct {
 	workersWg sync.WaitGroup
 	tasksWg   sync.WaitGroup
 
-	resizer *ratedResizer
-	once    sync.Once
+	strategy ResizingStrategy
+	once     sync.Once
 }
 
-// New creates new goroutine pool with given size. It also creates a work
-// queue of given size. Finally, it spawns given amount of goroutines
-// immediately.
-func New(maxWorkers, queueSize int) *Pool {
-	if maxWorkers <= 0 {
-		panic("maxWorkers must be greater than zero")
-	}
-	if queueSize < 0 {
-		panic("queueSize must be greater than or equal to zero")
-	}
-
+// New creates a new Pool that can be used to schedule tasks.
+func New(maxWorkers, queueSize int, opts ...Option) *Pool {
 	p := &Pool{
-		maxWorkers:     maxWorkers,
+		maxWorkers:  maxWorkers,
+		minWorkers:  0,
+		idleTimeout: defaultIdleTimeout,
+
 		runningWorkers: 0,
 		idleWorkers:    0,
 
@@ -59,8 +89,32 @@ func New(maxWorkers, queueSize int) *Pool {
 		workersWg: sync.WaitGroup{},
 		tasksWg:   sync.WaitGroup{},
 
-		resizer: NewRatedResizer(4),
-		once:    sync.Once{},
+		strategy: Eager(),
+		once:     sync.Once{},
+	}
+
+	for _, opt := range opts {
+		opt(p)
+	}
+
+	if p.maxWorkers <= 0 {
+		panic("max workers must be greater than zero")
+	}
+	if p.minWorkers < 0 {
+		panic("min workers must be greater or equal to zero")
+	}
+	if p.minWorkers > p.maxWorkers {
+		panic("min workers must be less or equal to max workers")
+	}
+	if queueSize < 0 {
+		panic("queue size must be greater or equal to zero")
+	}
+
+	p.workersWg.Add(1)
+	go p.purge()
+
+	for i := 0; i < p.minWorkers; i++ {
+		p.spawn(nil)
 	}
 
 	return p
@@ -87,6 +141,25 @@ func (p *Pool) RunningWorkers() int {
 // IdleWorkers returns the number of idle workers who are waiting for tasks
 func (p *Pool) IdleWorkers() int {
 	return int(atomic.LoadInt32(&p.idleWorkers))
+}
+
+func (p *Pool) purge() {
+	defer p.workersWg.Done()
+
+	ticker := time.NewTicker(p.idleTimeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopWorkersC:
+			return
+
+		case <-ticker.C:
+			if p.IdleWorkers() > 0 && p.RunningWorkers() > p.minWorkers {
+				p.workC <- nil
+			}
+		}
+	}
 }
 
 // Schedule schedules task to be executed over pool's workers with no provided timeout.
@@ -118,7 +191,7 @@ func (p *Pool) schedule(task func(), timeout <-chan time.Time) (err error) {
 	}
 
 	runningWorkers := p.RunningWorkers()
-	if p.IdleWorkers() == 0 && runningWorkers < p.maxWorkers && p.resizer.Resize(runningWorkers) {
+	if (p.IdleWorkers() == 0 && runningWorkers < p.maxWorkers && p.strategy.Resize(runningWorkers)) || runningWorkers < p.minWorkers {
 		p.spawn(task)
 		return nil
 	}
@@ -152,7 +225,11 @@ func (p *Pool) executeTask(task func(), firstTask bool) {
 }
 
 func (p *Pool) worker(task func()) {
-	p.executeTask(task, true)
+	if task != nil {
+		p.executeTask(task, true)
+	} else {
+		atomic.AddInt32(&p.idleWorkers, 1)
+	}
 
 	defer func() {
 		atomic.AddInt32(&p.idleWorkers, -1)
