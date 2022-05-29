@@ -1,6 +1,9 @@
 package gopool
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // TaskGroup represents a group of related tasks
 type TaskGroup struct {
@@ -16,6 +19,22 @@ func (g *TaskGroup) Schedule(task func()) error {
 		defer g.wg.Done()
 		task()
 	})
+	if err != nil {
+		g.wg.Done()
+		return err
+	}
+
+	return nil
+}
+
+// ScheduleTimeout adds a task to this group and sends it to the worker pool to be executed with a timeout
+func (g *TaskGroup) ScheduleTimeout(task func(), timeout time.Duration) error {
+	g.wg.Add(1)
+
+	err := g.pool.ScheduleTimeout(func() {
+		defer g.wg.Done()
+		task()
+	}, timeout)
 	if err != nil {
 		g.wg.Done()
 		return err
