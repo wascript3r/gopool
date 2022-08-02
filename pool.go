@@ -230,12 +230,14 @@ func (p *Pool) spawn(task func()) {
 
 func (p *Pool) executeTask(task func(), firstTask bool) {
 	defer p.tasksWg.Done()
+	defer func() {
+		atomic.AddInt32(&p.idleWorkers, 1)
+	}()
 
 	if !firstTask {
 		atomic.AddInt32(&p.idleWorkers, -1)
 	}
 	task()
-	atomic.AddInt32(&p.idleWorkers, 1)
 }
 
 func (p *Pool) worker(task func()) {
