@@ -2,6 +2,7 @@
 package gopool
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -126,6 +127,18 @@ func (p *Pool) TaskGroup() *TaskGroup {
 		pool: p,
 		wg:   sync.WaitGroup{},
 	}
+}
+
+// ErrGroup creates a new error group
+func (p *Pool) ErrGroup(ctx context.Context) (*ErrGroup, context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	return &ErrGroup{
+		pool:    p,
+		wg:      sync.WaitGroup{},
+		cancel:  cancel,
+		errOnce: sync.Once{},
+		err:     nil,
+	}, ctx
 }
 
 // MaxWorkers returns the pool size
